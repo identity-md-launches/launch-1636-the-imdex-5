@@ -12,12 +12,12 @@ Contracts only: no launch token, pool or website.
 
 | Path | What |
 | --- | --- |
-| `src/Imdex5.sol` | The index. One contract, no constructor arguments, 21.4 KB of runtime. |
+| `src/Imdex5.sol` | The index. One contract, no constructor arguments, 22.0 KB of runtime. |
 | `src/OracleAttestation.sol` | The protocol's `OracleAttestation` library and `OracleAttestationConsumer`, copied whole from the oracle-consumer reference. |
 | `src/Interfaces.sol` | The slices of the Uniswap v4 `PoolManager`, the launch registries and the Intake that the index calls. |
 | `test/Imdex5.t.sol` | Behaviour, failure and attack tests against mocks. |
 | `test/OracleConsumerConformance.t.sol` | The protocol's digest and selector vectors. |
-| `test/mocks/Mocks.sol` | Mock ERC-20, a constant-product stand-in for the PoolManager, registries, Intake, an ERC-1271 signer and a re-entering hook. |
+| `test/mocks/Mocks.sol` | Mock ERC-20 (can revert, return false or burn gas), a constant-product stand-in for the PoolManager (price limits, partial fills, short fills, the nonzero-delta count), registries, Intake, an ERC-1271 signer and a hook that re-enters, burns gas or leaves a delta unsettled. |
 | `lib/` | OpenZeppelin Contracts 5.6.1 and forge-std 1.9.6, vendored as ordinary files. |
 
 Build and test:
@@ -71,6 +71,8 @@ the brief's value, so nothing differs and nothing was substituted.
 | `WEIGHT_DIVISOR` | 4 | The 25% weight cap. |
 | `MAX_LIST` | 5 | The most launch numbers an answer may carry. |
 | `MIN_AGREED` | 4 | The panel agreement `onOracleResult` requires. |
+| `SWAP_GAS` | 1,000,000 | Gas given to each skippable swap (`swapSelf` from `rebalance` and `redeemToImd`). A hook that burns everything it is given costs at most this much per swap, so the rest of the call still runs. A swap that needs more is skipped (or, in `redeemToImd`, paid in kind). |
+| `PAY_GAS` | 300,000 | Gas given to each coin transfer in `redeem` and the in-kind part of `redeemToImd`. A coin that burns it all becomes owed instead of starving the next payment. |
 
 ## How it works
 
@@ -89,23 +91,33 @@ operation). A coin's balance may exceed `held[coin]` by the amounts recorded as 
 ### Mint
 
 - `mintFirst(imdIn, minOut[])`: only at supply 0. 0.50% of `imdIn` goes to `feeImd`; the rest
-  buys each coin of the list with an equal IMD part (any wei left by the division goes to
-  `idleImd`) and mints one share per IMD of the rest. Reverts if a buy reverts or returns under
-  its `minOut`. `minOut` has one entry per coin of the list, in list order.
+  buys each coin of the list with an equal IMD part and mints one share per IMD of the rest.
+  The IMD the swaps did not consume (the division's remainder, and whatever a pool whose
+  liquidity ran out could not take, which v4 reports in the swap's delta) goes to `idleImd`, so
+  every IMD the contract holds is accounted for. Reverts if a buy reverts, returns nothing (a
+  dust input the pool fee swallows whole is a failed buy, not a share for nothing) or returns
+  under its `minOut`. `minOut` has one entry per coin of the list, in list order.
 - `mint(shares, maxImdIn)`: supply > 0. Pulls `maxImdIn` first, buys exactly `held * f` of every
   coin (`f = shares / totalSupply`, rounded up), adds `idleImd * f` (rounded up) to `idleImd`,
   adds 0.50% of the buys' cost to `feeImd`, mints, and refunds the unspent IMD. Reverts if the
-  total exceeds `maxImdIn` or a buy reverts or fills short. No price is read; no cap.
+  total exceeds `maxImdIn`, if the total is zero (a share is never issued for nothing), or if a
+  buy reverts or fills short. No price is read; no cap. A list coin whose holding is zero (its
+  buy was skipped at the last rebalance) is not bought by `mint`, exactly as `held * f` says;
+  the next `rebalance` buys it from idle IMD.
 
 ### Redeem
 
 - `redeem(shares)`: burns, then pays 99.50% of `held * f` of each coin and of `idleImd * f`
   (100% when the supply reaches 0; the 0.50% stays with the remaining holders). No price, no
-  trade. A transfer that reverts, returns false or targets an address without code is recorded in
-  `owed[caller][coin]` instead of blocking; `claim(coin)` takes it later and can only pay once.
+  trade. Each transfer gets `PAY_GAS`; one that reverts, returns false, runs out of that gas or
+  targets an address without code is recorded in `owed[caller][coin]` instead of blocking;
+  `claim(coin)` takes it later and can only pay once.
 - `redeemToImd(shares, minImdOut)`: same burn and `f`; sells `held * f` of each coin inside the
   PoolManager's `unlock`, adds `idleImd * f`, keeps 0.50% as `feeImd`, pays the rest in IMD and
-  reverts under `minImdOut`. A coin whose sale reverts (or fills short) is paid in kind.
+  reverts under `minImdOut`. A coin whose sale reverts (or fills short) is paid in kind under
+  the same rule as `redeem`: 99.50% of the unsold part, the rest staying with the remaining
+  holders, and all of it when the supply reaches zero. Both redeem paths therefore pay the same
+  amount of a coin that cannot be sold.
 
 ### Oracle
 
@@ -140,7 +152,17 @@ operation). A coin's balance may exceed `held[coin]` by the amounts recorded as 
 4. Spends `idleImd` on the list in equal parts; a buy stops at 25% weight or a 2% price move.
 
 A swap that reverts is skipped (each swap is its own external self-call, `swapSelf`, so a revert
-undoes only that swap). The caller gets 0.25 IMD from `feeImd` if it can pay.
+undoes only that swap). The skip holds against a hook the launch chose that misbehaves only for
+the index: `swapSelf` is given `SWAP_GAS`, so a hook that burns all its gas costs one bounded
+swap, and after settling, `swapSelf` reads the manager's transient nonzero-delta count
+(`exttload` of Uniswap v4's `NonzeroDeltaCount` slot) and reverts if a hook left a delta of
+its own unsettled, which the manager would otherwise only reject at the end of `unlock`,
+undoing the whole rebalance. The caller gets 0.25 IMD from `feeImd` if it can pay.
+
+`ask()` may be called again 7 days after the last ask even when an answer was delivered but
+nobody submitted it; the new answer then replaces the old one. This is deliberate: an answer
+whose `submit` can never succeed (a launch number no registry records, a missing artifact) must
+not block the oracle loop forever, and the cost is bounded to the normal weekly 0.75 IMD.
 
 ## Security notes
 
@@ -149,20 +171,29 @@ undoes only that swap). The caller gets 0.25 IMD from `feeImd` if it can pay.
   `swapSelf` accepts only the contract itself. A hook or coin that re-enters hits the guard.
 - IMD is pulled only from `msg.sender`; the PoolManager is paid with `transfer` from the index's
   own balance, never `transferFrom` with another payer.
-- Shares are minted only against IMD actually spent: `mint` rounds every proportional amount up
-  and charges the swaps' real cost plus fee; `mintFirst` mints exactly the IMD it spent.
+- Shares are minted only against IMD actually paid: `mint` rounds every proportional amount up,
+  charges the swaps' real cost plus fee and refuses a mint that would cost nothing;
+  `mintFirst` refuses a buy that returns nothing and keeps the IMD the swaps did not consume
+  as the holders' idle IMD, so the index can never reach a supply with nothing behind it.
 - Redeem reads no price, makes no swap and cannot be blocked by a coin: failures become `owed`,
-  and `claim` zeroes the debt before paying.
+  each transfer is capped at `PAY_GAS` so a coin that burns gas cannot starve the next one, and
+  `claim` zeroes the debt before paying.
 - `feeImd` leaves only to the Intake (0.5 IMD) and as 0.25 IMD rewards.
 - A forged callback (wrong sender, wrong request id, thin agreement) is ignored; a forged
   attestation fails the signature; a tampered field changes the digest.
 
 Accepted, by the brief: thin-pool price impact, a pool's own hook fee, a dead pool blocking mint
-(never redeem), and an oracle that never answers. Also known and accepted: a coin that burns all
-forwarded gas in `transfer` can make a `redeem` run out of gas (the 63/64 rule leaves the caller
-little; retry with more gas). `submit` checks only the stored hash and the signature, as the brief
-asks, not the attestation's `expiresAt`: the hash already binds the answer to the index's own
-request, and the hash is cleared once a list is stored, so an attestation is taken once.
+(never redeem), and an oracle that never answers. A hook that burns gas or leaves a delta
+unsettled for the index's swaps makes that swap a skipped one in `rebalance` and an in-kind
+payment in `redeemToImd`; in `mint` and `mintFirst` it is a failed buy, which reverts, as a dead
+pool does. `submit` checks only the stored hash and the signature, as the brief asks, not the
+attestation's `expiresAt`: the hash already binds the answer to the index's own request, and the
+hash is cleared once a list is stored, so an attestation is taken once.
+
+Gas to supply: `rebalance` needs at most `SWAP_GAS` per swap it attempts (up to 5 sales of
+leavers, one trim per holding and one buy per list coin) plus a few hundred thousand; `redeem`
+needs `PAY_GAS` per coin plus overhead. Under that, a hostile hook or coin can still exhaust the
+call, which then simply reverts and can be retried with more gas.
 
 Tests passing is not an audit. Work holding other people's funds needs an independent
 adversarial review before release.

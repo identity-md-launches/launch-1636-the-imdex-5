@@ -44,8 +44,16 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
     /// @dev A limited swap stops where the sqrt price has moved 1% (the price about 2%).
     uint256 public constant SQRT_UP_BPS = 10_100;
     uint256 public constant SQRT_DOWN_BPS = 9_900;
+    /// @dev Gas given to one skippable swap (`swapSelf`) and to one coin payment (`_pay`), so a
+    /// hook or coin that burns everything it is given cannot starve the rest of the call.
+    uint256 public constant SWAP_GAS = 1_000_000;
+    uint256 public constant PAY_GAS = 300_000;
     /// @dev Uniswap v4 PoolManager: `_pools` is storage slot 6; `slot0` holds sqrtPriceX96 low.
     uint256 private constant POOLS_SLOT = 6;
+    /// @dev Uniswap v4 PoolManager: the transient count of addresses with an unsettled delta,
+    /// `uint256(keccak256("NonzeroDeltaCount")) - 1`.
+    bytes32 private constant NONZERO_DELTA_COUNT_SLOT =
+        0x7d4b3164c6e45b97e7d87b7125a44c5828d005af88f9d751cfd78729c5d99a0b;
     uint160 private constant MIN_SQRT_PRICE = 4_295_128_739;
     uint160 private constant MAX_SQRT_PRICE = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
     uint256 private constant Q96 = 2 ** 96;
@@ -89,6 +97,7 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
     error BadLength();
     error BuyFailed(address coin);
     error TooExpensive(uint256 cost);
+    error NothingToPay();
     error TooLittleOut(uint256 out);
     error NothingOwed();
     error RequestOpen();
@@ -163,7 +172,8 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
 
     // ---- mint ----
     /// @notice The first mint: 0.50% to `feeImd`, the rest buys the list in equal IMD parts,
-    /// one share per IMD of the rest. Reverts if a buy fails or returns under its `minOut`.
+    /// one share per IMD of the rest; what a pool could not take stays as the holders' idle IMD.
+    /// Reverts if a buy fails, returns nothing or returns under its `minOut`.
     function mintFirst(uint256 imdIn, uint256[] calldata minOut) external nonReentrant {
         if (totalSupply() != 0) revert NotFirstMint();
         if (imdIn == 0) revert ZeroAmount();
@@ -174,7 +184,7 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
 
     /// @notice Mints `shares` by buying exactly the proportional amount of every coin, plus the
     /// proportional idle IMD, plus 0.50% of the buys' cost as fee. `maxImdIn` is pulled first and
-    /// the unspent part refunded; reverts if the cost exceeds it or a buy fails.
+    /// the unspent part refunded; reverts if the cost exceeds it, is nothing, or a buy fails.
     function mint(uint256 shares, uint256 maxImdIn) external nonReentrant {
         if (totalSupply() == 0) revert FirstMintOnly();
         if (shares == 0) revert ZeroAmount();
@@ -209,7 +219,8 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
     }
 
     /// @notice Burns `shares`, sells the proportional holdings, adds the proportional idle IMD,
-    /// keeps 0.50% as fee and pays the rest in IMD. A coin whose sale fails is paid in kind.
+    /// keeps 0.50% as fee and pays the rest in IMD. A coin whose sale fails is paid in kind under
+    /// the redeem rule (99.50%, all of it when the supply reaches zero).
     function redeemToImd(uint256 shares, uint256 minImdOut) external nonReentrant {
         if (shares == 0) revert ZeroAmount();
         uint256 supply = totalSupply();
@@ -338,7 +349,8 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
         return "";
     }
 
-    /// @notice One swap, settled, as an external call so a failing one can be skipped. Only this
+    /// @notice One swap, settled, as an external call so a failing one can be skipped: the callers
+    /// give it `SWAP_GAS`, and it fails if any address is left with an unsettled delta. Only this
     /// contract calls it, from inside its own unlock.
     function swapSelf(address token, address hook, bool buy, uint256 amount, bool exactOut, bool limited)
         external
@@ -355,13 +367,17 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
         uint256 rest = imdIn - fee;
         uint256 n = listCount;
         uint256 part = rest / n;
+        uint256 spent = 0;
         for (uint256 i = 0; i < n; ++i) {
             Coin memory coin = _coins[i];
-            (, uint256 out) = _swap(coin.token, coin.hook, true, part, false, false);
+            (uint256 amountIn, uint256 out) = _swap(coin.token, coin.hook, true, part, false, false);
+            if (out == 0) revert BuyFailed(coin.token);
             if (out < minOut[i]) revert TooLittleOut(out);
+            spent += amountIn;
             held[coin.token] += out;
         }
-        idleImd += rest - part * n;
+        // the division's remainder and whatever a pool could not take stay the holders' idle IMD
+        idleImd += rest - spent;
         _mint(caller, rest);
         emit MintedFirst(caller, imdIn, rest);
     }
@@ -384,6 +400,7 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
         uint256 fee = Math.mulDiv(cost, FEE_BPS, BPS, Math.Rounding.Ceil);
         feeImd += fee;
         uint256 total = cost + idlePart + fee;
+        if (total == 0) revert NothingToPay();
         if (total > maxImdIn) revert TooExpensive(total);
         _mint(caller, shares);
         if (maxImdIn > total) IERC20(IMD).safeTransfer(caller, maxImdIn - total);
@@ -392,20 +409,21 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
 
     function _redeemToImd(address caller, uint256 shares, uint256 minImdOut, uint256 supply) private {
         uint256 proceeds = 0;
+        uint256 keepBps = supply == shares ? BPS : BPS - FEE_BPS;
         uint256 n = _coins.length;
         for (uint256 i = 0; i < n; ++i) {
             Coin memory coin = _coins[i];
             uint256 amount = Math.mulDiv(held[coin.token], shares, supply);
             if (amount == 0) continue;
             held[coin.token] -= amount;
-            try this.swapSelf(coin.token, coin.hook, false, amount, false, false) returns (
+            try this.swapSelf{gas: SWAP_GAS}(coin.token, coin.hook, false, amount, false, false) returns (
                 uint256 amountIn, uint256 sold
             ) {
                 proceeds += sold;
-                if (amountIn < amount) _pay(coin.token, caller, amount - amountIn);
+                if (amountIn < amount) _payInKind(coin.token, caller, amount - amountIn, keepBps);
             } catch {
                 emit SwapSkipped(coin.token, false, amount);
-                _pay(coin.token, caller, amount);
+                _payInKind(coin.token, caller, amount, keepBps);
             }
         }
         uint256 idlePart = Math.mulDiv(idleImd, shares, supply);
@@ -469,7 +487,9 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
 
     // ---- internals: swaps ----
     function _trySell(Coin memory coin, uint256 amount) private {
-        try this.swapSelf(coin.token, coin.hook, false, amount, false, true) returns (uint256 amountIn, uint256 out) {
+        try this.swapSelf{gas: SWAP_GAS}(coin.token, coin.hook, false, amount, false, true) returns (
+            uint256 amountIn, uint256 out
+        ) {
             held[coin.token] -= amountIn;
             idleImd += out;
         } catch {
@@ -478,7 +498,9 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
     }
 
     function _tryBuy(Coin memory coin, uint256 imdAmount) private {
-        try this.swapSelf(coin.token, coin.hook, true, imdAmount, false, true) returns (uint256 amountIn, uint256 out) {
+        try this.swapSelf{gas: SWAP_GAS}(coin.token, coin.hook, true, imdAmount, false, true) returns (
+            uint256 amountIn, uint256 out
+        ) {
             idleImd -= amountIn;
             held[coin.token] += out;
         } catch {
@@ -514,6 +536,8 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
             IPoolManager(POOL_MANAGER).settle();
         }
         if (amountOut > 0) IPoolManager(POOL_MANAGER).take(outCur, address(this), amountOut);
+        // a hook that left its own delta unsettled would revert the whole unlock later; fail here
+        if (IPoolManager(POOL_MANAGER).exttload(NONZERO_DELTA_COUNT_SLOT) != 0) revert BadDelta();
         emit Swapped(token, buy, amountIn, amountOut);
     }
 
@@ -543,12 +567,20 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
     }
 
     // ---- internals: payments ----
-    /// @dev Pays `amount` of `token`; a transfer that fails, returns false or targets no code is
-    /// recorded as owed instead of reverting.
+    /// @dev Pays a redeemer's proportional `amount` of `token` in kind under the redeem rule:
+    /// `keepBps` of it is paid and the rest stays with the remaining holders.
+    function _payInKind(address token, address to, uint256 amount, uint256 keepBps) private {
+        uint256 paid = amount * keepBps / BPS;
+        held[token] += amount - paid;
+        _pay(token, to, paid);
+    }
+
+    /// @dev Pays `amount` of `token` with `PAY_GAS`; a transfer that fails, returns false or
+    /// targets no code is recorded as owed instead of reverting.
     function _pay(address token, address to, uint256 amount) private {
         if (amount == 0) return;
         // slither-disable-next-line low-level-calls
-        (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        (bool ok, bytes memory ret) = token.call{gas: PAY_GAS}(abi.encodeCall(IERC20.transfer, (to, amount)));
         bool success =
             ok && (ret.length == 0 ? token.code.length > 0 : (ret.length >= 32 && uint256(bytes32(ret)) == 1));
         if (success) {

@@ -24,6 +24,7 @@ interface IPoolManager {
     function settle() external payable returns (uint256);
     function take(address currency, address to, uint256 amount) external;
     function extsload(bytes32 slot) external view returns (bytes32);
+    function exttload(bytes32 slot) external view returns (bytes32);
 }
 
 interface IUnlockCallback {

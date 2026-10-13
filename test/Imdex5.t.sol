@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {StdStorage, Test, stdStorage} from "forge-std/Test.sol";
 import {Imdex5} from "../src/Imdex5.sol";
 import {IPoolManager} from "../src/Interfaces.sol";
 import {OracleAttestation, OracleAttestationConsumer} from "../src/OracleAttestation.sol";
 import {MockERC20, MockIntake, MockPoolManager, MockRegistry, MockSigner, ReentrantHook} from "./mocks/Mocks.sol";
 
 contract Imdex5Test is Test {
+    using stdStorage for StdStorage;
+
     uint256 constant KEY_PK = 0xA11CE;
     address constant HOOK_G = 0x784FF9a3ac5d88A30bfff6F7f2a270161FBE6000;
+    address constant HOOK_M = 0xf0457dD0Cf526686190e4f057Ba19dB14D34a0cc;
     address constant NEW_TOKEN = 0x1111111111111111111111111111111111111111;
     uint256 constant COIN_RESERVE = 1_000_000e18;
     uint256 constant IMD_RESERVE = 10_000e18;
@@ -21,6 +24,7 @@ contract Imdex5Test is Test {
     MockRegistry regB;
     MockIntake intake;
     ReentrantHook hook;
+    ReentrantHook hookM;
     address signerKey;
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
@@ -45,6 +49,8 @@ contract Imdex5Test is Test {
         vm.etch(index.ORACLE_SIGNER(), address(new MockSigner(signerKey)).code);
         hook = ReentrantHook(HOOK_G);
         vm.etch(HOOK_G, address(new ReentrantHook()).code);
+        hookM = ReentrantHook(HOOK_M);
+        vm.etch(HOOK_M, address(new ReentrantHook()).code);
 
         Imdex5.Coin[] memory coins = index.coins();
         for (uint256 i = 0; i < coins.length; ++i) {
@@ -225,6 +231,50 @@ contract Imdex5Test is Test {
         index.mintFirst(1000e18, _zeros());
     }
 
+    function test_mintFirstRevertsWhenABuyReturnsNothing() public {
+        // a buy the pool fee swallows whole (one wei in, nothing out) is a failed buy, not a
+        // free share: the dust first mint reverts and the index stays open for an honest one
+        pm.setShortBy(_key(tokens[4], hooks[4]), type(uint256).max);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(Imdex5.BuyFailed.selector, tokens[4]));
+        index.mintFirst(6, _zeros());
+        assertEq(index.totalSupply(), 0);
+        assertEq(imd.balanceOf(bob), 10_000e18);
+        vm.prank(bob);
+        vm.expectRevert(Imdex5.FirstMintOnly.selector);
+        index.mint(1_000_000e18, 0);
+        pm.setShortBy(_key(tokens[4], hooks[4]), 0);
+        _mintFirst(alice, 1000e18);
+        assertEq(index.totalSupply(), 995e18);
+    }
+
+    function test_mintNeverIssuesSharesForNothing() public {
+        // a supply with nothing behind it (unreachable through the contract, forced here) cannot
+        // be minted against: a mint that would cost nothing reverts
+        stdstore.target(address(index)).sig("totalSupply()").checked_write(uint256(5));
+        assertEq(index.totalSupply(), 5);
+        vm.prank(bob);
+        vm.expectRevert(Imdex5.NothingToPay.selector);
+        index.mint(1_000_000e18, 0);
+        assertEq(index.balanceOf(bob), 0);
+    }
+
+    function test_mintFirstKeepsWhatAPoolCouldNotTakeAsIdle() public {
+        // one pool's liquidity ends after 10 IMD: the unspent 189 IMD of its part is the holders'
+        pm.setMaxIn(_key(tokens[2], hooks[2]), 10e18);
+        _mintFirst(alice, 1000e18);
+        assertEq(index.feeImd(), 5e18);
+        assertEq(index.totalSupply(), 995e18);
+        assertEq(index.idleImd(), 189e18);
+        assertEq(index.held(tokens[2]), COIN_RESERVE * 10e18 / (IMD_RESERVE + 10e18));
+        assertEq(imd.balanceOf(address(index)), index.feeImd() + index.idleImd());
+        // and it is paid out on redeem
+        vm.prank(alice);
+        index.redeem(995e18);
+        assertEq(imd.balanceOf(alice), 9000e18 + 189e18);
+        assertEq(index.idleImd(), 0);
+    }
+
     function test_mintFirstRequiresZeroSupplyAndRightLength() public {
         vm.prank(alice);
         vm.expectRevert(Imdex5.BadLength.selector);
@@ -353,6 +403,35 @@ contract Imdex5Test is Test {
         index.claim(tokens[2]);
     }
 
+    function test_redeemSurvivesCoinsThatBurnAllGas() public {
+        _mintFirst(alice, 1000e18);
+        MockERC20(tokens[2]).setFailMode(3);
+        MockERC20(tokens[3]).setFailMode(3);
+        uint256 heldBefore = index.held(tokens[2]);
+        uint256 expected = heldBefore * 500e18 * 9950 / (995e18 * 10_000);
+        vm.prank(alice);
+        index.redeem{gas: 3_000_000}(500e18);
+        assertEq(index.owed(alice, tokens[2]), expected);
+        assertEq(index.owed(alice, tokens[3]), expected);
+        assertEq(MockERC20(tokens[1]).balanceOf(alice), expected);
+        assertEq(index.held(tokens[2]), heldBefore - expected);
+        // the leftover 0.5% stays, so the second redeem still works with every coin hostile
+        for (uint256 i = 0; i < 5; ++i) {
+            MockERC20(tokens[i]).setFailMode(3);
+        }
+        vm.prank(alice);
+        index.redeem{gas: 3_000_000}(495e18);
+        assertEq(index.totalSupply(), 0);
+        for (uint256 i = 0; i < 5; ++i) {
+            assertEq(index.held(tokens[i]), 0);
+            assertGt(index.owed(alice, tokens[i]), 0);
+            MockERC20(tokens[i]).setFailMode(0);
+            vm.prank(alice);
+            index.claim(tokens[i]);
+            assertEq(MockERC20(tokens[i]).balanceOf(alice), heldBefore);
+        }
+    }
+
     function test_redeemRejectsZeroAndTooMany() public {
         _mintFirst(alice, 1000e18);
         vm.prank(alice);
@@ -397,8 +476,51 @@ contract Imdex5Test is Test {
         uint256 h = index.held(tokens[2]);
         vm.prank(alice);
         index.redeemToImd(199e18, 0);
-        assertEq(MockERC20(tokens[2]).balanceOf(alice), h * 199e18 / 995e18);
-        assertEq(index.held(tokens[2]), h - h * 199e18 / 995e18);
+        // the in-kind payment follows the redeem rule: 99.50%, the rest stays with the holders
+        uint256 part = h * 199e18 / 995e18;
+        uint256 paid = part * 9950 / 10_000;
+        assertEq(MockERC20(tokens[2]).balanceOf(alice), paid);
+        assertEq(index.held(tokens[2]), h - paid);
+        assertGt(imd.balanceOf(alice), 9000e18);
+        // the same redeem pays the same amount of that coin
+        vm.prank(alice);
+        index.redeemToImd(199e18, 0);
+        uint256 h2 = h - paid;
+        uint256 paid2 = (h2 * 199e18 / 796e18) * 9950 / 10_000;
+        assertEq(MockERC20(tokens[2]).balanceOf(alice), paid + paid2);
+        // the last redeemer takes all of it
+        vm.prank(alice);
+        index.redeemToImd(597e18, 0);
+        assertEq(index.held(tokens[2]), 0);
+        assertEq(MockERC20(tokens[2]).balanceOf(alice), h);
+        assertEq(index.totalSupply(), 0);
+        assertEq(imd.balanceOf(address(index)), index.feeImd() + index.idleImd());
+    }
+
+    function test_redeemToImdPaysAShortFillInKindLessHalfPercent() public {
+        _mintFirst(alice, 1000e18);
+        uint256 h = index.held(tokens[1]);
+        uint256 part = h * 199e18 / 995e18;
+        pm.setMaxIn(_key(tokens[1], hooks[1]), part / 2);
+        vm.prank(alice);
+        index.redeemToImd(199e18, 0);
+        uint256 unsold = part - part / 2;
+        uint256 paid = unsold * 9950 / 10_000;
+        assertEq(MockERC20(tokens[1]).balanceOf(alice), paid);
+        assertEq(index.held(tokens[1]), h - part / 2 - paid);
+        assertEq(MockERC20(tokens[1]).balanceOf(address(index)), index.held(tokens[1]));
+    }
+
+    function test_redeemToImdSurvivesAHookThatBurnsGas() public {
+        _mintFirst(alice, 1000e18);
+        hookM.setMisbehave(hookM.MISBEHAVE_BURN(), address(index));
+        uint256 h = index.held(tokens[1]);
+        vm.expectEmit(true, false, false, true, address(index));
+        emit Imdex5.SwapSkipped(tokens[1], false, h * 199e18 / 995e18);
+        vm.prank(alice);
+        index.redeemToImd{gas: 4_000_000}(199e18, 0);
+        uint256 paid = (h * 199e18 / 995e18) * 9950 / 10_000;
+        assertEq(MockERC20(tokens[1]).balanceOf(alice), paid);
         assertGt(imd.balanceOf(alice), 9000e18);
     }
 
@@ -733,6 +855,70 @@ contract Imdex5Test is Test {
         vm.prank(alice);
         index.redeem(995e18);
         assertEq(MockERC20(tokens[4]).balanceOf(alice), heldE);
+    }
+
+    function test_rebalanceSkipsAHookThatLeavesAnUnsettledDelta() public {
+        _mintFirst(alice, 1000e18);
+        uint64[] memory launches = new uint64[](5);
+        launches[0] = 1282;
+        launches[1] = 1283;
+        launches[2] = 737;
+        launches[3] = 1075;
+        launches[4] = 2000;
+        _deliverList(launches);
+        // MARG's hook takes one wei of IMD from the manager for the index's swaps and never
+        // settles it; the real manager would revert the whole unlock at its end
+        hookM.setMisbehave(hookM.MISBEHAVE_TAKE(), address(index));
+        uint256 heldM = index.held(tokens[1]);
+        vm.expectEmit(true, false, false, false, address(index));
+        emit Imdex5.SwapSkipped(tokens[1], true, 0);
+        vm.prank(bob);
+        index.rebalance{gas: 30_000_000}();
+        assertEq(index.held(tokens[1]), heldM);
+        assertEq(index.nextList().length, 0);
+        assertEq(index.listCount(), 5);
+        assertGt(index.held(NEW_TOKEN), 0);
+        assertEq(imd.balanceOf(address(index)), index.feeImd() + index.idleImd());
+        for (uint256 i = 0; i < 5; ++i) {
+            assertEq(MockERC20(tokens[i]).balanceOf(address(index)), index.held(tokens[i]));
+        }
+        // the oracle loop goes on
+        vm.warp(block.timestamp + 8 days);
+        vm.prank(bob);
+        index.ask();
+        assertEq(intake.count(), 2);
+    }
+
+    function test_rebalanceSurvivesAHookThatBurnsAllGas() public {
+        _mintFirst(alice, 1000e18);
+        // MARG leaves the list and is repriced 5x, so it is sold in step 1 and trimmed in step 3
+        pm.setPool(_key(tokens[1], hooks[1]), 0, 0);
+        _setPool(tokens[1], hooks[1], COIN_RESERVE, 5 * IMD_RESERVE);
+        uint64[] memory launches = new uint64[](4);
+        launches[0] = 1282;
+        launches[1] = 737;
+        launches[2] = 1075;
+        launches[3] = 2000;
+        _deliverList(launches);
+        hookM.setMisbehave(hookM.MISBEHAVE_BURN(), address(index));
+        uint256 heldM = index.held(tokens[1]);
+        // skipped twice: the step 1 sale and the step 3 trim; the buys of step 4 still run
+        vm.expectEmit(true, false, false, true, address(index));
+        emit Imdex5.SwapSkipped(tokens[1], false, heldM);
+        vm.expectEmit(true, false, false, false, address(index));
+        emit Imdex5.SwapSkipped(tokens[1], false, 0);
+        vm.prank(bob);
+        index.rebalance{gas: 8_000_000}();
+        assertEq(index.held(tokens[1]), heldM);
+        assertEq(index.listCount(), 4);
+        // MARG (unsold) and SC (partly sold under the 2% limit) stay as residuals
+        assertEq(index.coins().length, 6);
+        assertEq(index.coins()[4].token, tokens[1]);
+        assertEq(index.coins()[5].token, tokens[4]);
+        // the step 4 buys still ran
+        assertGt(index.held(NEW_TOKEN), 0);
+        assertEq(index.nextList().length, 0);
+        assertEq(imd.balanceOf(address(index)), index.feeImd() + index.idleImd());
     }
 
     function test_rebalanceWithNothingHeld() public {
