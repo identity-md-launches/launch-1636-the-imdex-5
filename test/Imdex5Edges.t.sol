@@ -443,7 +443,7 @@ contract Imdex5EdgesTest is Imdex5Base {
 
     /// forge-config: default.fuzz.runs = 512
     function testFuzz_mintFirstMintsExactlyTheRest(uint256 imdIn) public {
-        imdIn = bound(imdIn, 5, 5000e18);
+        imdIn = bound(imdIn, 6, 5000e18); // under 6 wei the equal part is 0 and the mint reverts
         _mintFirst(alice, imdIn);
         uint256 fee = (imdIn * 50 + 9999) / 10_000;
         uint256 rest = imdIn - fee;

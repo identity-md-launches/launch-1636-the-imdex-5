@@ -94,7 +94,7 @@ abstract contract Imdex5Base is Test {
     /// @dev The pool's IMD-per-coin price scaled by 1e18, from the mock's reserves.
     function _priceOf(address token, address hook_) internal view returns (uint256) {
         IPoolManager.PoolKey memory key = _key(token, hook_);
-        (uint256 r0, uint256 r1,,,) = pm.pools(pm.poolId(key));
+        (uint256 r0, uint256 r1,,,,) = pm.pools(pm.poolId(key));
         (uint256 coinR, uint256 imdR) = key.currency0 == token ? (r0, r1) : (r1, r0);
         return imdR * 1e18 / coinR;
     }

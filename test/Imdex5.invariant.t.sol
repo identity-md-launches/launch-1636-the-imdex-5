@@ -7,7 +7,7 @@ import {Imdex5} from "../src/Imdex5.sol";
 import {IPoolManager} from "../src/Interfaces.sol";
 import {OracleAttestation} from "../src/OracleAttestation.sol";
 import {Imdex5Base} from "./Imdex5Base.sol";
-import {MockERC20, MockIntake, MockPoolManager} from "./mocks/Mocks.sol";
+import {MockERC20, MockIntake, MockPoolManager, ReentrantHook} from "./mocks/Mocks.sol";
 
 /// @dev Drives the index with bounded inputs from three actors, toggles pool and coin failures,
 /// runs the oracle round through the mocked Intake, and asserts per-call facts about `feeImd`.
@@ -124,7 +124,8 @@ contract Imdex5Handler is CommonBase, StdUtils {
             require(index.balanceOf(who) == sharesBefore + shares, "wrong shares minted");
             require(paid <= maxIn, "mint pulled more than maxImdIn");
             require(index.feeImd() >= feeBefore, "mint reduced feeImd");
-            if (paid == 0 && holdsValue) ghostFreeMints += 1;
+            if (paid == 0) ghostFreeMints += 1;
+            require(holdsValue, "a mint succeeded while the index held nothing");
         } catch {}
     }
 
@@ -189,7 +190,21 @@ contract Imdex5Handler is CommonBase, StdUtils {
     function setCoinFailMode(uint256 coin, uint8 mode) external {
         calls["failMode"]++;
         coin = coin % tokens.length;
-        MockERC20(tokens[coin]).setFailMode(mode % 3);
+        MockERC20(tokens[coin]).setFailMode(mode % 4);
+    }
+
+    /// @dev Caps what a pool takes in one exact-input swap (0 lifts the cap): partial fills.
+    function setPoolMaxIn(uint256 coin, uint256 maxIn) external {
+        calls["maxIn"]++;
+        coin = coin % tokens.length;
+        pm.setMaxIn(_key(tokens[coin], hooks[coin]), bound(maxIn, 0, 500e18));
+    }
+
+    /// @dev The shared hook misbehaves for the index's swaps only: takes and never settles,
+    /// or burns every gas it is given. 0 restores it.
+    function setHookMisbehave(uint8 mode) external {
+        calls["hookMisbehave"]++;
+        ReentrantHook(hooks[0]).setMisbehave(mode % 3, address(index));
     }
 
     function warp(uint256 seconds_) external {
@@ -338,7 +353,7 @@ contract Imdex5InvariantTest is Imdex5Base {
         initialActorImd = 30_000e18;
         initialPoolImd = imd.balanceOf(address(pm));
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](17);
+        bytes4[] memory selectors = new bytes4[](19);
         selectors[0] = handler.fund.selector;
         selectors[1] = handler.mintFirst.selector;
         selectors[2] = handler.mint.selector;
@@ -356,6 +371,8 @@ contract Imdex5InvariantTest is Imdex5Base {
         selectors[14] = handler.submit.selector;
         selectors[15] = handler.rebalance.selector;
         selectors[16] = handler.mint.selector;
+        selectors[17] = handler.setPoolMaxIn.selector;
+        selectors[18] = handler.setHookMisbehave.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
